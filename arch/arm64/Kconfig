@@ -681,6 +681,8 @@ source "drivers/firmware/Kconfig"
 
 source "arch/arm64/fastcharge/Kconfig"
 
+source "arch/arm64/hotplug/Kconfig"
+
 source "fs/Kconfig"
 
 source "arch/arm64/kvm/Kconfig"
