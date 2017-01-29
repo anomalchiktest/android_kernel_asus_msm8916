@@ -29,15 +29,6 @@
 #include <linux/syscore_ops.h>
 #include <linux/tick.h>
 #include <trace/events/power.h>
-//ASUS Joy_Lin +++
-#ifdef CONFIG_ASUS_PERF
-#include <asm/uaccess.h>
-#include <linux/proc_fs.h>
-#include <linux/cpufreq.h>
-#include <linux/timer.h>
-#define ASUS_CB_FREQ_FILE "ASUS_CB_freq"
-#endif
-//ASUS Joy_Lin ---
 
 /**
  * The "cpufreq driver" - the arch- or hardware-dependent low
@@ -48,7 +39,7 @@ static struct cpufreq_driver *cpufreq_driver;
 static DEFINE_PER_CPU(struct cpufreq_policy *, cpufreq_cpu_data);
 static DEFINE_PER_CPU(struct cpufreq_policy *, cpufreq_cpu_data_fallback);
 static DEFINE_RWLOCK(cpufreq_driver_lock);
-static DEFINE_MUTEX(cpufreq_governor_lock);
+DEFINE_MUTEX(cpufreq_governor_lock);
 static LIST_HEAD(cpufreq_policy_list);
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -461,9 +452,7 @@ static ssize_t store_##file_name					\
 	int ret;							\
 	struct cpufreq_policy new_policy;				\
 									\
-	ret = cpufreq_get_policy(&new_policy, policy->cpu);		\
-	if (ret)							\
-		return -EINVAL;						\
+	memcpy(&new_policy, policy, sizeof(*policy));			\
 									\
 	new_policy.min = new_policy.user_policy.min;			\
 	new_policy.max = new_policy.user_policy.max;			\
@@ -523,10 +512,11 @@ static ssize_t store_scaling_governor(struct cpufreq_policy *policy,
 	int ret;
 	char	str_governor[16];
 	struct cpufreq_policy new_policy;
+	char *envp[3];
+	char buf1[64];
+	char buf2[64];
 
-	ret = cpufreq_get_policy(&new_policy, policy->cpu);
-	if (ret)
-		return ret;
+	memcpy(&new_policy, policy, sizeof(*policy));
 
 	ret = sscanf(buf, "%15s", str_governor);
 	if (ret != 1)
@@ -536,12 +526,22 @@ static ssize_t store_scaling_governor(struct cpufreq_policy *policy,
 						&new_policy.governor))
 		return -EINVAL;
 
+	new_policy.min = new_policy.user_policy.min;
+	new_policy.max = new_policy.user_policy.max;
+
 	ret = cpufreq_set_policy(policy, &new_policy);
 
 	policy->user_policy.policy = policy->policy;
 	policy->user_policy.governor = policy->governor;
 
 	sysfs_notify(&policy->kobj, NULL, "scaling_governor");
+
+	snprintf(buf1, sizeof(buf1), "GOV=%s", policy->governor->name);
+	snprintf(buf2, sizeof(buf2), "CPU=%u", policy->cpu);
+	envp[0] = buf1;
+	envp[1] = buf2;
+	envp[2] = NULL;
+	kobject_uevent_env(cpufreq_global_kobject, KOBJ_ADD, envp);
 
 	if (ret)
 		return ret;
@@ -891,9 +891,6 @@ static void cpufreq_init_policy(struct cpufreq_policy *policy)
 
 	/* set default policy */
 	ret = cpufreq_set_policy(policy, &new_policy);
-	policy->user_policy.policy = policy->policy;
-	policy->user_policy.governor = policy->governor;
-
 	if (ret) {
 		pr_debug("setting policy failed\n");
 		if (cpufreq_driver->exit)
@@ -1073,15 +1070,17 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
 	read_unlock_irqrestore(&cpufreq_driver_lock, flags);
 #endif
 
-	if (frozen)
-		/* Restore the saved policy when doing light-weight init */
-		policy = cpufreq_policy_restore(cpu);
-	else
+	/*
+	 * Restore the saved policy when doing light-weight init and fall back
+	 * to the full init if that fails.
+	 */
+	policy = frozen ? cpufreq_policy_restore(cpu) : NULL;
+	if (!policy) {
+		frozen = false;
 		policy = cpufreq_policy_alloc();
-
-	if (!policy)
-		goto nomem_out;
-
+		if (!policy)
+			goto nomem_out;
+	}
 
 	/*
 	 * In the resume path, since we restore a saved policy, the assignment
@@ -1126,8 +1125,10 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
 	 */
 	cpumask_and(policy->cpus, policy->cpus, cpu_online_mask);
 
-	policy->user_policy.min = policy->min;
-	policy->user_policy.max = policy->max;
+	if (!frozen) {
+		policy->user_policy.min = policy->min;
+		policy->user_policy.max = policy->max;
+	}
 
 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
 				     CPUFREQ_START, policy);
@@ -1165,6 +1166,11 @@ static int __cpufreq_add_dev(struct device *dev, struct subsys_interface *sif,
 
 	cpufreq_init_policy(policy);
 
+	if (!frozen) {
+		policy->user_policy.policy = policy->policy;
+		policy->user_policy.governor = policy->governor;
+	}
+
 	write_lock_irqsave(&cpufreq_driver_lock, flags);
 	for_each_cpu(j, policy->cpus)
 		per_cpu(cpufreq_cpu_data, j) = policy;
@@ -1187,8 +1193,11 @@ err_get_freq:
 	if (cpufreq_driver->exit)
 		cpufreq_driver->exit(policy);
 err_set_policy_cpu:
-	if (frozen)
+	if (frozen) {
+		/* Do not leave stale fallback data behind. */
+		per_cpu(cpufreq_cpu_data_fallback, cpu) = NULL;
 		cpufreq_policy_put_kobj(policy);
+	}
 	cpufreq_policy_free(policy);
 
 nomem_out:
@@ -2024,84 +2033,10 @@ EXPORT_SYMBOL(cpufreq_get_policy);
  * policy : current policy.
  * new_policy: policy to be set.
  */
-//ASUS Joy_Lin +++
-#ifdef CONFIG_ASUS_PERF
-unsigned int asus_boost_freq = 0;
-static int readflag = 0;
-static DEFINE_MUTEX(boost_freq_control_mutex);
-
-static ssize_t asus_proc_file_read_file(struct file *filp, char __user *buff, size_t len, loff_t *off)
-{
-	char print_buf[32];
-	unsigned int ret = 0,iret = 0;
-	sprintf(print_buf, "asusdebug: %s\n", asus_boost_freq? "on":"off");
-
-	ret = strlen(print_buf);
-	iret = copy_to_user(buff, print_buf, ret);
-	if (!readflag){
-		readflag = 1;
-		return ret;
-	}
-	else{
-		readflag = 0;
-		return 0;
-	}
-}
-
-static ssize_t __ref asus_proc_file_write_file(struct file *filp, const char __user *buff, size_t len, loff_t *off)
-{
-	char messages[32];
-	int i;
-
-	memset(messages, 0, 32);
-	if (len > 32)
-		len = 32;
-	if (copy_from_user(messages, buff, len))
-		return -EFAULT;
-	messages[1]='\0';
-	printk("[POWER_HINT_CAM] CPUfeq boost:%s\n",messages);
-	mutex_lock(&boost_freq_control_mutex);
-	if(strncmp(messages, "1", 1) == 0)
-	{
-		asus_boost_freq = 1;
-		for(i=0; i<4; i++){
-			cpufreq_update_policy(i);
-		}
-	}
-	else if(strncmp(messages, "0", 1) == 0)
-	{
-		asus_boost_freq = 0;
-		for(i=0; i<4; i++){
-			cpufreq_update_policy(i);
-		}
-	}
-	else
-		return 0;
-	mutex_unlock(&boost_freq_control_mutex);
-	return len;
-	}
-
-static struct file_operations create_asus_proc_file = {
-	.read = asus_proc_file_read_file,
-	.write = asus_proc_file_write_file,
-};
-
-static int __init camera_boost_init(void)
-{
-	proc_create(ASUS_CB_FREQ_FILE, S_IRWXUGO, NULL, &create_asus_proc_file);
-	return 0;
-}
-module_init(camera_boost_init);
-#endif
-//ASUS Joy_Lin ---
-
 static int cpufreq_set_policy(struct cpufreq_policy *policy,
 				struct cpufreq_policy *new_policy)
 {
 	int ret = 0, failed = 1;
-#ifdef CONFIG_ASUS_PERF
-	int cpuinfo_max = 0;
-#endif
 
 	pr_debug("setting new policy for CPU %u: %u - %u kHz\n", new_policy->cpu,
 		new_policy->min, new_policy->max);
@@ -2139,22 +2074,8 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
 			CPUFREQ_NOTIFY, new_policy);
 
-	//ASUS Joy_Lin +++
-#ifdef CONFIG_ASUS_PERF
-	cpuinfo_max = policy->cpuinfo.max_freq;
-	if( asus_boost_freq == 1 && policy->max > 800000 ){
-		policy->max = cpuinfo_max;
-		policy->min = policy->max;
-	}
-	else{
-		policy->min = new_policy->min;
-		policy->max = new_policy->max;
-	}
-#else
 	policy->min = new_policy->min;
 	policy->max = new_policy->max;
-#endif
-	//ASUS Joy_Lin ---
 
 	pr_debug("new min and max freqs are %u - %u kHz\n",
 					policy->min, policy->max);
